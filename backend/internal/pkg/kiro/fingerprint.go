@@ -43,8 +43,9 @@ var (
 		"win32":  {"10.0.22631"},
 	}
 	nodeVersions = []string{"22.22.0"}
+	// 需跟随 kiro-account-manager 版本定期同步更新
 	kiroVersions = []string{
-		"0.11.132", "0.11.131", "0.11.130",
+		"0.12.155", "0.12.154", "0.12.153",
 	}
 )
 
@@ -215,11 +216,18 @@ func BuildRuntimeUserAgent(accountKey, machineID string) string {
 
 func BuildRuntimeAmzUserAgent(accountKey, machineID string) string {
 	fp := globalRuntimeFingerprints().Get(accountKey, machineID)
+	if fp.KiroHash != "" {
+		return fmt.Sprintf(
+			"aws-sdk-js/%s KiroIDE %s %s",
+			fp.StreamingSDKVersion,
+			fp.KiroVersion,
+			fp.KiroHash,
+		)
+	}
 	return fmt.Sprintf(
-		"aws-sdk-js/%s KiroIDE-%s-%s",
+		"aws-sdk-js/%s KiroIDE-%s",
 		fp.StreamingSDKVersion,
 		fp.KiroVersion,
-		fp.KiroHash,
 	)
 }
 

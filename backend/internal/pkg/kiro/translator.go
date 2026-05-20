@@ -6,13 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -86,6 +87,7 @@ type ParseResult struct {
 type KiroRequestContext struct {
 	ToolNameMap         map[string]string
 	ThinkingEnabled     bool
+	ThinkingEffort      string
 	CacheEmulationUsage *Usage
 }
 
@@ -95,9 +97,10 @@ type KiroBuildResult struct {
 }
 
 type KiroPayload struct {
-	ConversationState KiroConversationState `json:"conversationState"`
-	ProfileArn        string                `json:"profileArn,omitempty"`
-	InferenceConfig   *KiroInferenceConfig  `json:"inferenceConfig,omitempty"`
+	ConversationState            KiroConversationState `json:"conversationState"`
+	ProfileArn                   string                `json:"profileArn,omitempty"`
+	InferenceConfig              *KiroInferenceConfig  `json:"inferenceConfig,omitempty"`
+	AdditionalModelRequestFields map[string]any        `json:"additionalModelRequestFields,omitempty"`
 }
 
 type KiroInferenceConfig struct {
@@ -229,6 +232,67 @@ type kiroSemanticEvent struct {
 	ContextUsagePercentage float64
 }
 
+// kiroConvIDCache maps a hashed session hint to a stable conversationId with TTL.
+var (
+	kiroConvIDMu    sync.RWMutex
+	kiroConvIDCache = make(map[string]kiroConvIDEntry)
+)
+
+type kiroConvIDEntry struct {
+	id        string
+	expiresAt time.Time
+}
+
+// resolveKiroConversationID returns a stable conversationId for the request.
+// It checks well-known session headers; if none are present it falls back to a
+// fresh UUID (stateless behaviour).
+func resolveKiroConversationID(headers http.Header) string {
+	if headers == nil {
+		return uuid.NewString()
+	}
+	for _, h := range []string{"X-Claude-Code-Session-Id", "X-Conversation-Id", "X-Session-Id"} {
+		if v := strings.TrimSpace(headers.Get(h)); v != "" {
+			return stableKiroConversationID(v)
+		}
+	}
+	return uuid.NewString()
+}
+
+// stableKiroConversationID returns the same UUID for the same hint within a 2-hour window.
+func stableKiroConversationID(hint string) string {
+	key := hashKiroSessionHint(hint)
+	kiroConvIDMu.RLock()
+	if e, ok := kiroConvIDCache[key]; ok && e.expiresAt.After(time.Now()) {
+		kiroConvIDMu.RUnlock()
+		return e.id
+	}
+	kiroConvIDMu.RUnlock()
+
+	kiroConvIDMu.Lock()
+	defer kiroConvIDMu.Unlock()
+	// double-check after acquiring write lock
+	if e, ok := kiroConvIDCache[key]; ok && e.expiresAt.After(time.Now()) {
+		return e.id
+	}
+	id := uuid.NewString()
+	kiroConvIDCache[key] = kiroConvIDEntry{id: id, expiresAt: time.Now().Add(2 * time.Hour)}
+	// prune expired entries when the map grows large
+	if len(kiroConvIDCache) > 1000 {
+		now := time.Now()
+		for k, v := range kiroConvIDCache {
+			if v.expiresAt.Before(now) {
+				delete(kiroConvIDCache, k)
+			}
+		}
+	}
+	return id
+}
+
+func hashKiroSessionHint(hint string) string {
+	sum := sha256.Sum256([]byte(hint))
+	return hex.EncodeToString(sum[:16])
+}
+
 func MapModel(model string) string {
 	switch strings.TrimSpace(strings.ToLower(model)) {
 	case "claude-opus-4-7", "claude-opus-4-7-thinking", "claude-opus-4.7":
@@ -336,7 +400,7 @@ func BuildKiroPayloadWithContext(claudeBody []byte, modelID, profileArn, origin 
 		}
 	}
 
-	conversationID := uuid.NewString()
+	conversationID := resolveKiroConversationID(headers)
 
 	payload := KiroPayload{
 		ConversationState: KiroConversationState{
@@ -348,6 +412,23 @@ func BuildKiroPayloadWithContext(claudeBody []byte, modelID, profileArn, origin 
 		},
 		ProfileArn:      profileArn,
 		InferenceConfig: inferenceConfig,
+	}
+	// 设置 thinking 控制：使用 API 字段而非 system prompt XML（实测 XML 被 CW 忽略且有害）
+	if thinking != nil {
+		budget := thinking.BudgetTokens
+		if budget <= 0 {
+			budget = 10000 // Claude Code 默认值
+		}
+		effort := budgetTokensToEffort(budget)
+		payload.AdditionalModelRequestFields = map[string]any{
+			"thinking": map[string]any{
+				"type": "adaptive",
+			},
+			"output_config": map[string]any{
+				"effort": effort,
+			},
+		}
+		requestCtx.ThinkingEffort = effort
 	}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -1071,6 +1152,19 @@ func thinkingDirectiveFromModel(model string) *thinkingDirective {
 	}
 }
 
+func budgetTokensToEffort(budget int) string {
+	switch {
+	case budget >= 30000:
+		return "max"
+	case budget >= 15000:
+		return "high"
+	case budget >= 5000:
+		return "medium"
+	default:
+		return "low"
+	}
+}
+
 func buildInjectedSystemPrompt(systemPrompt string, thinking *thinkingDirective, toolChoiceHint string) string {
 	systemPrompt = strings.TrimSpace(systemPrompt)
 	timestampContext := fmt.Sprintf("[Context: Current time is %s]", time.Now().Format("2006-01-02 15:04:05 MST"))
@@ -1087,24 +1181,6 @@ func buildInjectedSystemPrompt(systemPrompt string, thinking *thinkingDirective,
 	}
 	if !strings.Contains(systemPrompt, systemChunkedWritePolicy) {
 		systemPrompt += "\n" + systemChunkedWritePolicy
-	}
-	if thinking != nil {
-		switch thinking.Mode {
-		case "adaptive":
-			effort := strings.TrimSpace(thinking.Effort)
-			if effort == "" {
-				effort = "high"
-			}
-			thinkingPrefix := "<thinking_mode>adaptive</thinking_mode>\n<thinking_effort>" + effort + "</thinking_effort>"
-			return thinkingPrefix + "\n\n" + systemPrompt
-		default:
-			budget := thinking.BudgetTokens
-			if budget <= 0 {
-				budget = 16000
-			}
-			thinkingPrefix := "<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>" + strconv.Itoa(budget) + "</max_thinking_length>"
-			return thinkingPrefix + "\n\n" + systemPrompt
-		}
 	}
 	return systemPrompt
 }

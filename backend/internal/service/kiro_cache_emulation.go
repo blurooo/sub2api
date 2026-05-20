@@ -27,6 +27,7 @@ const (
 	kiroCacheMinTokensOpus       = 4096
 	kiroCacheMinTokensHaiku3     = 2048
 	kiroCachePrefixLookbackLimit = 10
+	kiroCacheMaxRatio            = 0.85
 )
 
 type kiroCacheEmulationUsage struct {
@@ -41,6 +42,14 @@ type kiroCacheEntry struct {
 	tokens    int
 	ttl       time.Duration
 	expiresAt time.Time
+}
+
+// KiroCacheTracker computes and updates cache hit/miss state for Kiro cache emulation.
+// Implementations must be safe for concurrent use.
+type KiroCacheTracker interface {
+	// ComputeAndUpdate atomically computes cache hit/miss for the given profile and
+	// updates the stored state. Returns the cache usage for this request.
+	ComputeAndUpdate(credKey uint64, profile *kiroCacheProfile) *kiroCacheEmulationUsage
 }
 
 type kiroCacheTracker struct {
@@ -63,8 +72,11 @@ func (s *GatewayService) buildKiroCacheEmulationUsage(account *Account, group *G
 	if cacheKey == 0 {
 		return nil
 	}
-	result := globalKiroCacheTracker.compute(cacheKey, profile)
-	globalKiroCacheTracker.update(cacheKey, profile)
+	tracker := s.kiroCacheTracker
+	if tracker == nil {
+		tracker = globalKiroCacheTracker
+	}
+	result := tracker.ComputeAndUpdate(cacheKey, profile)
 	ratio := group.EffectiveKiroCacheEmulationRatio()
 	result.CacheReadInputTokens = scaleKiroCacheTokens(result.CacheReadInputTokens, ratio)
 	result.CacheCreationInputTokens = scaleKiroCacheTokens(result.CacheCreationInputTokens, ratio)
@@ -302,7 +314,8 @@ func (p *kiroCacheProfile) lastCacheableBreakpoint() *kiroResolvedBreakpoint {
 	return &last
 }
 
-func (t *kiroCacheTracker) compute(cacheKey uint64, profile *kiroCacheProfile) *kiroCacheEmulationUsage {
+// ComputeAndUpdate atomically computes cache hit/miss and updates stored state.
+func (t *kiroCacheTracker) ComputeAndUpdate(cacheKey uint64, profile *kiroCacheProfile) *kiroCacheEmulationUsage {
 	out := &kiroCacheEmulationUsage{}
 	if t == nil || profile == nil || cacheKey == 0 {
 		return out
@@ -317,6 +330,7 @@ func (t *kiroCacheTracker) compute(cacheKey uint64, profile *kiroCacheProfile) *
 	defer t.mu.Unlock()
 	t.pruneLocked(now)
 
+	// compute: find longest matching cached prefix
 	matchedTokens := 0
 	if accountEntries := t.entries[cacheKey]; accountEntries != nil {
 		breakpoints := profile.cacheableBreakpoints()
@@ -333,36 +347,8 @@ func (t *kiroCacheTracker) compute(cacheKey uint64, profile *kiroCacheProfile) *
 			break
 		}
 	}
-	newTokens := max(lastBreakpointTokens-matchedTokens, 0)
-	out.CacheReadInputTokens = max(matchedTokens, 0)
-	out.CacheCreationInputTokens = newTokens
-	out.CacheCreation5mInputTokens, out.CacheCreation1hInputTokens = profile.ttlBreakdown(matchedTokens)
-	return out
-}
 
-func (p *kiroCacheProfile) ttlBreakdown(matchedTokens int) (int, int) {
-	lastBreakpoint := p.lastCacheableBreakpoint()
-	if lastBreakpoint == nil {
-		return 0, 0
-	}
-	newTokens := max(min(lastBreakpoint.cumulativeTokens, p.totalInputTokens)-matchedTokens, 0)
-	if newTokens == 0 {
-		return 0, 0
-	}
-	if lastBreakpoint.ttl >= kiroCacheOneHourTTL {
-		return 0, newTokens
-	}
-	return newTokens, 0
-}
-
-func (t *kiroCacheTracker) update(cacheKey uint64, profile *kiroCacheProfile) {
-	if t == nil || profile == nil || cacheKey == 0 {
-		return
-	}
-	now := time.Now()
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.pruneLocked(now)
+	// update: write all cacheable breakpoints
 	accountEntries := t.entries[cacheKey]
 	if accountEntries == nil {
 		accountEntries = make(map[[32]byte]kiroCacheEntry)
@@ -383,7 +369,33 @@ func (t *kiroCacheTracker) update(cacheKey uint64, profile *kiroCacheProfile) {
 		}
 		accountEntries[block.prefixFingerprint] = kiroCacheEntry{tokens: block.cumulativeTokens, ttl: breakpoint.ttl, expiresAt: expiresAt}
 	}
+
+	newTokens := max(lastBreakpointTokens-matchedTokens, 0)
+	reportedRead := matchedTokens
+	if maxCacheable := int(float64(profile.totalInputTokens) * kiroCacheMaxRatio); reportedRead > maxCacheable {
+		reportedRead = maxCacheable
+	}
+	out.CacheReadInputTokens = max(reportedRead, 0)
+	out.CacheCreationInputTokens = newTokens
+	out.CacheCreation5mInputTokens, out.CacheCreation1hInputTokens = profile.ttlBreakdown(matchedTokens)
+	return out
 }
+
+func (p *kiroCacheProfile) ttlBreakdown(matchedTokens int) (int, int) {
+	lastBreakpoint := p.lastCacheableBreakpoint()
+	if lastBreakpoint == nil {
+		return 0, 0
+	}
+	newTokens := max(min(lastBreakpoint.cumulativeTokens, p.totalInputTokens)-matchedTokens, 0)
+	if newTokens == 0 {
+		return 0, 0
+	}
+	if lastBreakpoint.ttl >= kiroCacheOneHourTTL {
+		return 0, newTokens
+	}
+	return newTokens, 0
+}
+
 
 func (t *kiroCacheTracker) pruneLocked(now time.Time) {
 	for cacheKey, accountEntries := range t.entries {

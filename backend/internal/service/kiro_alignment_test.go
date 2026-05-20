@@ -38,6 +38,16 @@ func (s *kiroUsageCooldownStore) GetState(context.Context, string) (*kirocooldow
 	return s.state, s.err
 }
 
+func (s *kiroUsageCooldownStore) GetStateBatch(_ context.Context, tokenKeys []string) (map[string]*kirocooldown.State, error) {
+	result := make(map[string]*kirocooldown.State, len(tokenKeys))
+	for _, k := range tokenKeys {
+		if s.state != nil {
+			result[k] = s.state
+		}
+	}
+	return result, s.err
+}
+
 func (s *kiroUsageCooldownStore) ClearEarliestTransientCooldown(context.Context, []string) (bool, error) {
 	return false, nil
 }
@@ -128,7 +138,8 @@ func TestAccountUsageService_GetUsage_KiroMapsCredits(t *testing.T) {
 		require.Equal(t, "Bearer kiro-access-token", r.Header.Get("Authorization"))
 		require.Equal(t, "*/*", r.Header.Get("Accept"))
 		require.True(t, strings.Contains(r.Header.Get("User-Agent"), "KiroIDE-"))
-		require.True(t, strings.Contains(r.Header.Get("X-Amz-User-Agent"), "KiroIDE-"))
+		// X-Amz-User-Agent: "KiroIDE <ver> <machineId>" (with machineId) or "KiroIDE-<ver>" (without)
+		require.True(t, strings.Contains(r.Header.Get("X-Amz-User-Agent"), "KiroIDE"))
 		require.Equal(t, "vibe", r.Header.Get("x-amzn-kiro-agent-mode"))
 		require.Equal(t, "true", r.Header.Get("x-amzn-codewhisperer-optout"))
 		require.NotEmpty(t, r.Header.Get("Amz-Sdk-Invocation-Id"))

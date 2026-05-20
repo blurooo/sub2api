@@ -99,6 +99,19 @@ func (s *stubKiroCooldownStore) GetState(context.Context, string) (*kirocooldown
 	return s.state, s.stateErr
 }
 
+func (s *stubKiroCooldownStore) GetStateBatch(_ context.Context, tokenKeys []string) (map[string]*kirocooldown.State, error) {
+	result := make(map[string]*kirocooldown.State, len(tokenKeys))
+	if s.clearCalled && s.clearResult {
+		return result, nil
+	}
+	for _, k := range tokenKeys {
+		if s.state != nil {
+			result[k] = s.state
+		}
+	}
+	return result, s.stateErr
+}
+
 func (s *stubKiroCooldownStore) ClearEarliestTransientCooldown(_ context.Context, tokenKeys []string) (bool, error) {
 	s.clearCalled = true
 	s.clearKeys = append([]string(nil), tokenKeys...)

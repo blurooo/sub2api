@@ -265,10 +265,12 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 
 	// 计算粘性会话hash
 	parsedReq.SessionContext = &service.SessionContext{
-		ClientIP:  ip.GetClientIP(c),
-		UserAgent: c.GetHeader("User-Agent"),
-		APIKeyID:  apiKey.ID,
-		UserID:    subject.UserID,
+		ClientIP:            ip.GetClientIP(c),
+		UserAgent:           c.GetHeader("User-Agent"),
+		APIKeyID:            apiKey.ID,
+		UserID:              subject.UserID,
+		ClaudeCodeSessionID: strings.TrimSpace(c.GetHeader("x-claude-code-session-id")),
+		OpenCodeSession:     strings.TrimSpace(c.GetHeader("x-opencode-session")),
 	}
 	sessionHash := h.gatewayService.GenerateSessionHash(parsedReq)
 
@@ -1534,10 +1536,12 @@ func (h *GatewayHandler) CountTokens(c *gin.Context) {
 
 	// 计算粘性会话 hash
 	parsedReq.SessionContext = &service.SessionContext{
-		ClientIP:  ip.GetClientIP(c),
-		UserAgent: c.GetHeader("User-Agent"),
-		APIKeyID:  apiKey.ID,
-		UserID:    subject.UserID,
+		ClientIP:            ip.GetClientIP(c),
+		UserAgent:           c.GetHeader("User-Agent"),
+		APIKeyID:            apiKey.ID,
+		UserID:              subject.UserID,
+		ClaudeCodeSessionID: strings.TrimSpace(c.GetHeader("x-claude-code-session-id")),
+		OpenCodeSession:     strings.TrimSpace(c.GetHeader("x-opencode-session")),
 	}
 	sessionHash := h.gatewayService.GenerateSessionHash(parsedReq)
 

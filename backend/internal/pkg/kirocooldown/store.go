@@ -30,6 +30,9 @@ const (
 	activeTTL    = 10 * time.Second
 	stateTTL     = 25 * time.Hour
 	keyPrefix    = "kiro:cooldown:"
+
+	recoveryLockKey = "kiro:cooldown:recovery:lock"
+	recoveryLockTTL = 2 * time.Second
 )
 
 var (
@@ -141,6 +144,14 @@ func (e *Error) Error() string {
 		return fmt.Sprintf("kiro token is in cooldown for %v", e.remaining.Round(time.Second))
 	}
 	return fmt.Sprintf("kiro token is in cooldown for %v (reason: %s)", e.remaining.Round(time.Second), e.reason)
+}
+
+// Remaining returns the cooldown duration remaining.
+func (e *Error) Remaining() time.Duration {
+	if e == nil {
+		return 0
+	}
+	return e.remaining
 }
 
 func Calculate429Cooldown(retryCount int) time.Duration {
@@ -297,35 +308,85 @@ func (s *Store) GetState(ctx context.Context, tokenKey string) (*State, error) {
 		return nil, fmt.Errorf("kiro cooldown get state: unexpected response length %d", len(values))
 	}
 
+	return parseStateFromValues(values, time.Now()), nil
+}
+
+// parseStateFromValues parses a *State from the three HMGet fields
+// [cooldown_until_ms, cooldown_reason, fail_count]. Returns nil when the
+// account is not in cooldown.
+func parseStateFromValues(values []interface{}, now time.Time) *State {
+	if len(values) != 3 {
+		return nil
+	}
 	cooldownUntilMS, err := luaInt64(values[0])
-	if err != nil && values[0] != nil {
-		return nil, fmt.Errorf("kiro cooldown get state cooldown_until_ms: %w", err)
+	if err != nil || cooldownUntilMS <= 0 {
+		return nil
 	}
-	reason, err := luaString(values[1])
-	if err != nil {
-		return nil, fmt.Errorf("kiro cooldown get state reason: %w", err)
-	}
-	failCount, err := luaInt64(values[2])
-	if err != nil && values[2] != nil {
-		return nil, fmt.Errorf("kiro cooldown get state fail_count: %w", err)
-	}
-	if cooldownUntilMS <= 0 {
-		return nil, nil
-	}
-
 	cooldownUntil := time.UnixMilli(cooldownUntilMS)
-	remaining := time.Until(cooldownUntil)
+	remaining := cooldownUntil.Sub(now)
 	if remaining <= 0 {
-		return nil, nil
+		return nil
 	}
-
+	reason, _ := luaString(values[1])
+	failCount, _ := luaInt64(values[2])
 	return &State{
 		Active:        true,
 		Reason:        reason,
 		CooldownUntil: cooldownUntil,
 		Remaining:     remaining,
 		FailCount:     int(failCount),
-	}, nil
+	}
+}
+
+// GetStateBatch fetches cooldown states for multiple token keys in a single
+// Redis pipeline, avoiding N serial RTTs during candidate filtering.
+func (s *Store) GetStateBatch(ctx context.Context, tokenKeys []string) (map[string]*State, error) {
+	if err := s.validate(); err != nil {
+		return nil, err
+	}
+	if len(tokenKeys) == 0 {
+		return map[string]*State{}, nil
+	}
+
+	cacheCtx, cancel := withRedisTimeout(ctx)
+	defer cancel()
+
+	// Deduplicate and build redisKey → tokenKey mapping.
+	redisKeys := make([]string, 0, len(tokenKeys))
+	keyMap := make(map[string]string, len(tokenKeys)) // redisKey → tokenKey
+	seen := make(map[string]struct{}, len(tokenKeys))
+	for _, tk := range tokenKeys {
+		rk := RedisKey(tk)
+		if _, ok := seen[rk]; ok {
+			continue
+		}
+		seen[rk] = struct{}{}
+		redisKeys = append(redisKeys, rk)
+		keyMap[rk] = tk
+	}
+
+	pipe := s.client.Pipeline()
+	cmds := make([]*redis.SliceCmd, 0, len(redisKeys))
+	for _, rk := range redisKeys {
+		cmds = append(cmds, pipe.HMGet(cacheCtx, rk, "cooldown_until_ms", "cooldown_reason", "fail_count"))
+	}
+	if _, err := pipe.Exec(cacheCtx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("kiro cooldown get state batch: %w", err)
+	}
+
+	now := time.Now()
+	result := make(map[string]*State, len(tokenKeys))
+	for i, cmd := range cmds {
+		tk := keyMap[redisKeys[i]]
+		values, err := cmd.Result()
+		if err != nil {
+			continue // single-key error does not abort the batch
+		}
+		if state := parseStateFromValues(values, now); state != nil {
+			result[tk] = state
+		}
+	}
+	return result, nil
 }
 
 func (s *Store) ClearEarliestTransientCooldown(ctx context.Context, tokenKeys []string) (bool, error) {
@@ -353,6 +414,7 @@ func (s *Store) ClearEarliestTransientCooldown(ctx context.Context, tokenKeys []
 	cacheCtx, cancel := withRedisTimeout(ctx)
 	defer cancel()
 
+	// Phase 1: pipeline read (cross-slot safe, concurrent reads are fine).
 	type candidate struct {
 		redisKey        string
 		cooldownUntilMS int64
@@ -403,6 +465,23 @@ func (s *Store) ClearEarliestTransientCooldown(ctx context.Context, tokenKeys []
 	if best == nil {
 		return false, nil
 	}
+
+	// Phase 2: acquire a short-lived distributed lock before writing so that
+	// concurrent pods that read the same snapshot don't each clear a different
+	// account's cooldown (thundering-herd). SET NX is atomic; if we don't get
+	// the lock we treat it as "another instance is already recovering" and
+	// return false without error.
+	lockCtx, lockCancel := withRedisTimeout(ctx)
+	defer lockCancel()
+	acquired, err := s.client.SetNX(lockCtx, recoveryLockKey, 1, recoveryLockTTL).Result()
+	if err != nil {
+		return false, fmt.Errorf("kiro cooldown recovery lock: %w", err)
+	}
+	if !acquired {
+		// Another instance is handling recovery right now; skip.
+		return false, nil
+	}
+	defer s.client.Del(lockCtx, recoveryLockKey) //nolint:errcheck
 
 	if err := s.client.HDel(cacheCtx, best.redisKey, "cooldown_until_ms", "cooldown_reason").Err(); err != nil {
 		return false, fmt.Errorf("kiro cooldown clear transient: %w", err)

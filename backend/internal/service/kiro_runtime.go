@@ -88,12 +88,13 @@ func (s *GatewayService) forwardKiroMessages(ctx context.Context, c *gin.Context
 			var failoverErr *UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
 				appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
-					Platform:           account.Platform,
-					AccountID:          account.ID,
-					AccountName:        account.Name,
-					UpstreamStatusCode: failoverErr.StatusCode,
-					Kind:               "failover",
-					Message:            sanitizeUpstreamErrorMessage(err.Error()),
+					Platform:              account.Platform,
+					AccountID:             account.ID,
+					AccountName:           account.Name,
+					UpstreamStatusCode:    failoverErr.StatusCode,
+					Kind:                  "failover",
+					Message:               sanitizeUpstreamErrorMessage(err.Error()),
+					KiroCooldownRemaining: failoverErr.KiroCooldownRemainingSec,
 				})
 				return nil, failoverErr
 			}
@@ -137,6 +138,7 @@ func (s *GatewayService) forwardKiroMessages(ctx context.Context, c *gin.Context
 			Duration:         time.Since(startTime),
 			FirstTokenMs:     streamResult.firstTokenMs,
 			ClientDisconnect: streamResult.clientDisconnect,
+			KiroAccountKey:   truncateKiroAccountKey(buildKiroAccountKey(account)),
 		}, nil
 	}
 
@@ -159,12 +161,13 @@ func (s *GatewayService) forwardKiroMessages(ctx context.Context, c *gin.Context
 			}
 			c.Data(http.StatusOK, "application/json", webSearchResult.ResponseBody)
 			return &ForwardResult{
-				RequestID:     webSearchResult.RequestID,
-				Usage:         webSearchResult.Usage,
-				Model:         originalModel,
-				UpstreamModel: upstreamModel,
-				Stream:        false,
-				Duration:      time.Since(startTime),
+				RequestID:      webSearchResult.RequestID,
+				Usage:          webSearchResult.Usage,
+				Model:          originalModel,
+				UpstreamModel:  upstreamModel,
+				Stream:         false,
+				Duration:       time.Since(startTime),
+				KiroAccountKey: truncateKiroAccountKey(buildKiroAccountKey(account)),
 			}, nil
 		default:
 			var httpErr *kiroWebSearchHTTPError
@@ -174,12 +177,13 @@ func (s *GatewayService) forwardKiroMessages(ctx context.Context, c *gin.Context
 			var failoverErr *UpstreamFailoverError
 			if errors.As(webSearchErr, &failoverErr) {
 				appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
-					Platform:           account.Platform,
-					AccountID:          account.ID,
-					AccountName:        account.Name,
-					UpstreamStatusCode: failoverErr.StatusCode,
-					Kind:               "failover",
-					Message:            sanitizeUpstreamErrorMessage(webSearchErr.Error()),
+					Platform:              account.Platform,
+					AccountID:             account.ID,
+					AccountName:           account.Name,
+					UpstreamStatusCode:    failoverErr.StatusCode,
+					Kind:                  "failover",
+					Message:               sanitizeUpstreamErrorMessage(webSearchErr.Error()),
+					KiroCooldownRemaining: failoverErr.KiroCooldownRemainingSec,
 				})
 				return nil, failoverErr
 			}
@@ -201,12 +205,13 @@ func (s *GatewayService) forwardKiroMessages(ctx context.Context, c *gin.Context
 		var failoverErr *UpstreamFailoverError
 		if errors.As(err, &failoverErr) {
 			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
-				Platform:           account.Platform,
-				AccountID:          account.ID,
-				AccountName:        account.Name,
-				UpstreamStatusCode: failoverErr.StatusCode,
-				Kind:               "failover",
-				Message:            sanitizeUpstreamErrorMessage(err.Error()),
+				Platform:              account.Platform,
+				AccountID:             account.ID,
+				AccountName:           account.Name,
+				UpstreamStatusCode:    failoverErr.StatusCode,
+				Kind:                  "failover",
+				Message:               sanitizeUpstreamErrorMessage(err.Error()),
+				KiroCooldownRemaining: failoverErr.KiroCooldownRemainingSec,
 			})
 			return nil, failoverErr
 		}
@@ -239,6 +244,10 @@ func (s *GatewayService) forwardKiroMessages(ctx context.Context, c *gin.Context
 		return nil, err
 	}
 
+	if parseErr := s.markKiroSuccess(ctx, buildKiroAccountKey(account)); parseErr != nil {
+		logger.L().Warn("kiro mark success failed", zap.Error(parseErr))
+	}
+
 	c.Header("Content-Type", "application/json")
 	if requestID := resp.Header.Get("x-request-id"); requestID != "" {
 		c.Header("x-request-id", requestID)
@@ -248,12 +257,13 @@ func (s *GatewayService) forwardKiroMessages(ctx context.Context, c *gin.Context
 	upstreamModel := normalizeModelNameForPricing(kiropkg.MapModel(mappedModel))
 
 	return &ForwardResult{
-		RequestID:     resp.Header.Get("x-request-id"),
-		Usage:         kiroUsageToClaude(parseResult.Usage, inputTokens),
-		Model:         originalModel,
-		UpstreamModel: upstreamModel,
-		Stream:        false,
-		Duration:      time.Since(startTime),
+		RequestID:      resp.Header.Get("x-request-id"),
+		Usage:          kiroUsageToClaude(parseResult.Usage, inputTokens),
+		Model:          originalModel,
+		UpstreamModel:  upstreamModel,
+		Stream:         false,
+		Duration:       time.Since(startTime),
+		KiroAccountKey: truncateKiroAccountKey(buildKiroAccountKey(account)),
 	}, nil
 }
 
@@ -312,8 +322,12 @@ func (s *GatewayService) openKiroAnthropicStreamResponse(ctx context.Context, ac
 		defer func() { _ = resp.Body.Close() }()
 		_, streamErr := kiropkg.StreamEventStreamAsAnthropicWithContext(ctx, resp.Body, pw, mappedModel, inputTokens, requestCtx)
 		if streamErr != nil {
+			logger.L().Warn("kiro stream error after 2xx", zap.Error(streamErr))
 			_ = pw.CloseWithError(streamErr)
 			return
+		}
+		if markErr := s.markKiroSuccess(ctx, buildKiroAccountKey(account)); markErr != nil {
+			logger.L().Warn("kiro mark success failed after stream", zap.Error(markErr))
 		}
 		_ = pw.Close()
 	}()
@@ -435,6 +449,20 @@ func (s *GatewayService) executeKiroUpstreamWithParsed(ctx context.Context, acco
 					if _, err := s.markKiroSuspended(ctx, accountKey); err != nil {
 						return nil, requestCtx, err
 					}
+					// Persist to DB so the account requires manual recovery, not just a 24h cooldown.
+					if account != nil && s.accountRepo != nil {
+						bodyExcerpt := truncateForLog(respBody, 256)
+						errMsg := fmt.Sprintf("kiro account suspended by Amazon Q: %s", bodyExcerpt)
+						if dbErr := s.accountRepo.SetError(ctx, account.ID, errMsg); dbErr != nil {
+							logger.L().Warn("kiro suspended SetError failed",
+								zap.Int64("account_id", account.ID), zap.Error(dbErr))
+						} else {
+							logger.L().Warn("kiro account suspended, persisted to DB (requires manual recovery)",
+								zap.Int64("account_id", account.ID),
+								zap.String("body_excerpt", bodyExcerpt),
+							)
+						}
+					}
 					resetHTTPResponseBody(resp, respBody)
 					return resp, requestCtx, nil
 				}
@@ -478,16 +506,29 @@ func (s *GatewayService) executeKiroUpstreamWithParsed(ctx context.Context, acco
 				}
 				classification := classifyKiroHTTPError(resp.StatusCode, string(respBody))
 				logKiroBadRequestClassification(classification, account, mappedModel, resp.Header, respBody)
+				// bad_request_auth (invalid_grant / token expired): treat like 401 — try ForceRefresh once.
+				if classification.Category == kiroErrorBadRequestAuth && s.kiroTokenProvider != nil && attempt < maxRetries {
+					refreshedToken, refreshErr := s.kiroTokenProvider.ForceRefreshAccessToken(ctx, account)
+					if refreshErr == nil && strings.TrimSpace(refreshedToken) != "" {
+						currentToken = refreshedToken
+						accountKey = buildKiroAccountKey(account)
+						buildResult, err = s.buildKiroPayloadForAccount(ctx, account, anthropicBody, modelID, currentToken, requestModel, headers)
+						if err != nil {
+							return nil, requestCtx, err
+						}
+						payload = buildResult.Payload
+						requestCtx = buildResult.Context
+						logKiroStatelessReplay(account, buildResult.Payload)
+						if sleepErr := sleepKiroRetry(ctx, attempt); sleepErr != nil {
+							return nil, requestCtx, sleepErr
+						}
+						continue
+					}
+				}
 				resetHTTPResponseBody(resp, respBody)
 				return resp, requestCtx, nil
 			}
 
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				if err := s.markKiroSuccess(ctx, accountKey); err != nil {
-					_ = resp.Body.Close()
-					return nil, requestCtx, err
-				}
-			}
 			return resp, requestCtx, nil
 		}
 	}
@@ -496,12 +537,23 @@ func (s *GatewayService) executeKiroUpstreamWithParsed(ctx context.Context, acco
 
 func buildKiroEndpoints(account *Account) []kiroEndpointConfig {
 	region := kiroAPIRegion(account)
-	return []kiroEndpointConfig{
-		{
-			URL:  fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
-			Name: "AmazonQ",
-		},
+	amazonQ := kiroEndpointConfig{
+		URL:  fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
+		Name: "AmazonQ",
 	}
+	// IDC 账号只用 AmazonQ（CodeWhisperer 不支持 IDC auth）
+	if account != nil && strings.EqualFold(strings.TrimSpace(account.GetCredential("auth_method")), "external_idp") {
+		return []kiroEndpointConfig{amazonQ}
+	}
+	// Social / Builder ID 账号：AmazonQ 优先，失败后回退 CodeWhisperer
+	codeWhisperer := kiroEndpointConfig{
+		URL:  "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
+		Name: "CodeWhisperer",
+	}
+	// AmazonQCLI (SendMessageStreaming) 端点暂未启用。
+	// 如需支持，需在 payload 中删除 agentContinuationId 和 agentTaskType 字段，
+	// 并使用 x-amzn-kiro-agent-mode: vibe。
+	return []kiroEndpointConfig{amazonQ, codeWhisperer}
 }
 
 func (s *GatewayService) buildKiroPayloadForAccount(ctx context.Context, account *Account, anthropicBody []byte, modelID, token, requestModel string, headers http.Header) (*kiropkg.KiroBuildResult, error) {
@@ -588,6 +640,11 @@ func nextKiroMonthlyResetUTC(now time.Time) time.Time {
 	return time.Date(year, month+1, 1, 0, 0, 0, 0, time.UTC)
 }
 
+func nextKiroDailyResetUTC(now time.Time) time.Time {
+	utc := now.UTC()
+	return time.Date(utc.Year(), utc.Month(), utc.Day()+1, 0, 0, 0, 0, time.UTC)
+}
+
 func resetHTTPResponseBody(resp *http.Response, body []byte) {
 	if resp == nil {
 		return
@@ -665,6 +722,109 @@ func (s *GatewayService) handleKiroHTTPError(ctx context.Context, resp *http.Res
 		s.markKiroInvalidModelRateLimited(ctx, account, mappedModel)
 		event := s.buildKiroInvalidModelUpstreamEvent(account, resp, upstreamMsg, mappedModel, requestBody, c)
 		appendOpsUpstreamError(c, event)
+		return &UpstreamFailoverError{
+			StatusCode:      resp.StatusCode,
+			ResponseBody:    respBody,
+			ResponseHeaders: resp.Header.Clone(),
+		}
+	}
+
+	// profile_error: profileArn misconfigured — temporarily take the account offline.
+	if classification.Category == kiroErrorProfileError {
+		if account != nil {
+			s.markKiroAuthTemporarilyUnavailable(ctx, account, resp.StatusCode, string(respBody))
+			logger.L().Warn("kiro profile error, account temporarily unavailable",
+				zap.Int64("account_id", account.ID),
+				zap.String("profile_arn_suffix", kiroProfileArnSuffix(account.GetCredential("profile_arn"))),
+				zap.String("category", classification.Category),
+			)
+		}
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			Platform:           account.Platform,
+			AccountID:          account.ID,
+			AccountName:        account.Name,
+			UpstreamStatusCode: resp.StatusCode,
+			UpstreamRequestID:  resp.Header.Get("x-request-id"),
+			Kind:               "failover",
+			Message:            upstreamMsg,
+		})
+		return &UpstreamFailoverError{
+			StatusCode:      resp.StatusCode,
+			ResponseBody:    respBody,
+			ResponseHeaders: resp.Header.Clone(),
+		}
+	}
+
+	// bad_request_auth: token expired/invalid — temporarily take the account offline and failover.
+	if classification.Category == kiroErrorBadRequestAuth {
+		if account != nil {
+			s.markKiroAuthTemporarilyUnavailable(ctx, account, resp.StatusCode, string(respBody))
+		}
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			Platform:           account.Platform,
+			AccountID:          account.ID,
+			AccountName:        account.Name,
+			UpstreamStatusCode: resp.StatusCode,
+			UpstreamRequestID:  resp.Header.Get("x-request-id"),
+			Kind:               "failover",
+			Message:            upstreamMsg,
+		})
+		return &UpstreamFailoverError{
+			StatusCode:      resp.StatusCode,
+			ResponseBody:    respBody,
+			ResponseHeaders: resp.Header.Clone(),
+		}
+	}
+
+	// quota_exhausted: credits depleted — rate-limit until next daily reset.
+	if classification.Category == kiroErrorQuotaExhausted {
+		if account != nil && s.accountRepo != nil {
+			resetAt := nextKiroDailyResetUTC(time.Now())
+			if err := s.accountRepo.SetRateLimited(ctx, account.ID, resetAt); err != nil {
+				logger.L().Warn("kiro quota exhausted rate-limit failed",
+					zap.Int64("account_id", account.ID), zap.Error(err))
+			} else {
+				logger.L().Warn("kiro quota exhausted, rate-limited until daily reset",
+					zap.Int64("account_id", account.ID), zap.Time("reset_at", resetAt))
+			}
+		}
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			Platform:           account.Platform,
+			AccountID:          account.ID,
+			AccountName:        account.Name,
+			UpstreamStatusCode: resp.StatusCode,
+			UpstreamRequestID:  resp.Header.Get("x-request-id"),
+			Kind:               "failover",
+			Message:            upstreamMsg,
+		})
+		return &UpstreamFailoverError{
+			StatusCode:      resp.StatusCode,
+			ResponseBody:    respBody,
+			ResponseHeaders: resp.Header.Clone(),
+		}
+	}
+
+	// overage_exhausted: overage credits also depleted — rate-limit until next monthly reset.
+	if classification.Category == kiroErrorOverageExhausted {
+		if account != nil && s.accountRepo != nil {
+			resetAt := nextKiroMonthlyResetUTC(time.Now())
+			if err := s.accountRepo.SetRateLimited(ctx, account.ID, resetAt); err != nil {
+				logger.L().Warn("kiro overage exhausted rate-limit failed",
+					zap.Int64("account_id", account.ID), zap.Error(err))
+			} else {
+				logger.L().Warn("kiro overage exhausted, rate-limited until monthly reset",
+					zap.Int64("account_id", account.ID), zap.Time("reset_at", resetAt))
+			}
+		}
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			Platform:           account.Platform,
+			AccountID:          account.ID,
+			AccountName:        account.Name,
+			UpstreamStatusCode: resp.StatusCode,
+			UpstreamRequestID:  resp.Header.Get("x-request-id"),
+			Kind:               "failover",
+			Message:            upstreamMsg,
+		})
 		return &UpstreamFailoverError{
 			StatusCode:      resp.StatusCode,
 			ResponseBody:    respBody,

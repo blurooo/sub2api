@@ -263,9 +263,11 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 		parsedReq, _ := service.ParseGatewayRequest(body, domain.PlatformGemini)
 		if parsedReq != nil {
 			parsedReq.SessionContext = &service.SessionContext{
-				ClientIP:  ip.GetClientIP(c),
-				UserAgent: c.GetHeader("User-Agent"),
-				APIKeyID:  apiKey.ID,
+				ClientIP:            ip.GetClientIP(c),
+				UserAgent:           c.GetHeader("User-Agent"),
+				APIKeyID:            apiKey.ID,
+				ClaudeCodeSessionID: strings.TrimSpace(c.GetHeader("x-claude-code-session-id")),
+				OpenCodeSession:     strings.TrimSpace(c.GetHeader("x-opencode-session")),
 			}
 		}
 		sessionHash = h.gatewayService.GenerateSessionHash(parsedReq)

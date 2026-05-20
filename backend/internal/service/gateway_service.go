@@ -507,6 +507,9 @@ type ForwardResult struct {
 	// 图片生成计费字段（图片生成模型使用）
 	ImageCount int    // 生成的图片数量
 	ImageSize  string // 图片尺寸 "1K", "2K", "4K"
+
+	// Kiro 诊断字段：脱敏后的账号 key 前 8 位，仅 Kiro 请求填充
+	KiroAccountKey string `json:"kiro_account_key,omitempty"`
 }
 
 // UpstreamFailoverError indicates an upstream error that should trigger account failover.
@@ -516,6 +519,9 @@ type UpstreamFailoverError struct {
 	ResponseHeaders        http.Header // 上游响应头，用于透传 cf-ray/cf-mitigated/content-type 等诊断信息
 	ForceCacheBilling      bool        // Antigravity 粘性会话切换时设为 true
 	RetryableOnSameAccount bool        // 临时性错误（如 Google 间歇性 400、空响应），应在同一账号上重试 N 次再切换
+	// KiroCooldownRemainingSec is set when the failover was triggered by a Kiro
+	// cooldown (rate_limit_exceeded). Used to populate OpsUpstreamErrorEvent.
+	KiroCooldownRemainingSec int
 }
 
 func (e *UpstreamFailoverError) Error() string {
@@ -560,11 +566,13 @@ type GatewayService struct {
 	claudeTokenProvider   *ClaudeTokenProvider
 	kiroTokenProvider     *KiroTokenProvider
 	kiroCooldownStore     KiroCooldownStore
+	kiroCacheTracker      KiroCacheTracker  // nil falls back to globalKiroCacheTracker
 	sessionLimitCache     SessionLimitCache // 会话数量限制缓存（仅 Anthropic OAuth/SetupToken）
 	rpmCache              RPMCache          // RPM 计数缓存（仅 Anthropic OAuth/SetupToken）
 	userGroupRateResolver *userGroupRateResolver
 	userGroupRateCache    *gocache.Cache
 	userGroupRateSF       singleflight.Group
+	kiroRecoverySFG       singleflight.Group
 	modelsListCache       *gocache.Cache
 	modelsListCacheTTL    time.Duration
 	settingService        *SettingService
@@ -661,13 +669,48 @@ func NewGatewayService(
 	return svc
 }
 
+// WithKiroCacheTracker sets the KiroCacheTracker used for cache emulation.
+// If not called (or called with nil), the global in-memory tracker is used as fallback.
+func (s *GatewayService) WithKiroCacheTracker(t KiroCacheTracker) *GatewayService {
+	s.kiroCacheTracker = t
+	return s
+}
+
+// sessionHashFromString returns a 16-char hex hash of the given string,
+// used for stable sticky-session keys derived from header values.
+func sessionHashFromString(v string) string {
+	sum := sha256.Sum256([]byte(v))
+	return fmt.Sprintf("%x", sum[:8]) // 16 hex chars
+}
+
 // GenerateSessionHash 从预解析请求计算粘性会话 hash
 func (s *GatewayService) GenerateSessionHash(parsed *ParsedRequest) string {
 	if parsed == nil {
 		return ""
 	}
 
-	// 1. 最高优先级：从 metadata.user_id 提取 session_xxx
+	// 0. 最高优先级：x-claude-code-session-id（Claude Code 最稳定的会话标识）
+	if parsed.SessionContext != nil {
+		if v := parsed.SessionContext.ClaudeCodeSessionID; v != "" {
+			hash := sessionHashFromString(v)
+			slog.Info("sticky.hash_source",
+				"source", "x-claude-code-session-id",
+				"hash", hash,
+			)
+			return hash
+		}
+		// 次优先级：x-opencode-session
+		if v := parsed.SessionContext.OpenCodeSession; v != "" {
+			hash := sessionHashFromString(v)
+			slog.Info("sticky.hash_source",
+				"source", "x-opencode-session",
+				"hash", hash,
+			)
+			return hash
+		}
+	}
+
+	// 1. 次高优先级：从 metadata.user_id 提取 session_xxx
 	if parsed.MetadataUserID != "" {
 		uid := ParseMetadataUserID(parsed.MetadataUserID)
 		if uid != nil && uid.SessionID != "" {
@@ -1658,6 +1701,16 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 					if stickyAccount, ok := accountByID[stickyAccountID]; ok {
 						var stickyCacheMissReason string
 
+						// 粘性账号处于 Kiro cooldown 时，清除绑定并走正常选账号流程
+						if !s.isKiroRuntimeSchedulable(ctx, stickyAccount) {
+							logger.LegacyPrintf("service.gateway", "[KiroStickyEvict] kiro sticky session evicted due to cooldown session=%s evicted_account_id=%d",
+								sessionHash[:min(8, len(sessionHash))], stickyAccountID)
+							if s.cache != nil {
+								_ = s.cache.DeleteSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
+							}
+							// 不使用此粘性账号，继续走负载感知选择
+						} else {
+
 						gatePass := s.isAccountSchedulableForSelection(stickyAccount) &&
 							s.isAccountAllowedForPlatform(stickyAccount, platform, useMixed) &&
 							(requestedModel == "" || s.isModelSupportedByAccountWithContext(ctx, stickyAccount, requestedModel)) &&
@@ -1727,6 +1780,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 							logger.LegacyPrintf("service.gateway", "[StickyCacheMiss] reason=%s account_id=%d session=%s current_rpm=%d base_rpm=%d",
 								stickyCacheMissReason, stickyAccountID, shortSessionHash(sessionHash), currentRPM, baseRPM)
 						}
+						} // end else (not in kiro cooldown)
 					} else {
 						_ = s.cache.DeleteSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
 						logger.LegacyPrintf("service.gateway", "[StickyCacheMiss] reason=account_cleared account_id=%d session=%s current_rpm=0 base_rpm=0",
@@ -1839,6 +1893,14 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 					_ = s.cache.DeleteSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
 				}
 
+				// 粘性账号处于 Kiro cooldown 时，清除绑定并跳过
+				if !clearSticky && !s.isKiroRuntimeSchedulable(ctx, account) {
+					logger.LegacyPrintf("service.gateway", "[KiroStickyEvict] kiro sticky session evicted due to cooldown session=%s evicted_account_id=%d",
+						sessionHash[:min(8, len(sessionHash))], accountID)
+					_ = s.cache.DeleteSessionAccountID(ctx, derefGroupID(groupID), sessionHash)
+					clearSticky = true
+				}
+
 				// 注意：不再检查 isAccountInGroup，因为 accountByID 已经从按分组过滤的
 				// accounts 列表构建，账号一定在分组内。而 scheduler snapshot 缓存
 				// 反序列化后 AccountGroups 字段为空，导致 isAccountInGroup 永远返回 false。
@@ -1947,6 +2009,8 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 		"reason", "sticky_not_used_falling_back_to_load_balance",
 		"total_accounts", len(accounts),
 	)
+	// 批量预取 Kiro cooldown 状态（避免 N 次串行 RTT）
+	kiroCooldownStates := s.batchGetKiroCooldownStates(ctx, accounts)
 	candidates := make([]*Account, 0, len(accounts))
 	for i := range accounts {
 		acc := &accounts[i]
@@ -1965,7 +2029,10 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 		if requestedModel != "" && !s.isModelSupportedByAccountWithContext(ctx, acc, requestedModel) {
 			continue
 		}
-		if !s.isAccountSchedulableForModelSelection(ctx, acc, requestedModel) {
+		if !acc.IsSchedulableForModelWithContext(ctx, requestedModel) {
+			continue
+		}
+		if !s.isKiroRuntimeSchedulableFromCache(acc, kiroCooldownStates) {
 			continue
 		}
 		// 配额检查
@@ -2394,6 +2461,46 @@ func (s *GatewayService) isKiroRuntimeSchedulable(ctx context.Context, account *
 	return state == nil || !state.Active
 }
 
+// isKiroRuntimeSchedulableFromCache checks schedulability using a pre-fetched
+// batch of cooldown states, avoiding a Redis round-trip per account.
+func (s *GatewayService) isKiroRuntimeSchedulableFromCache(account *Account, states map[string]*kirocooldown.State) bool {
+	if account == nil || account.Platform != PlatformKiro || account.Type != AccountTypeOAuth {
+		return true
+	}
+	if states == nil {
+		return true
+	}
+	state, ok := states[buildKiroAccountKey(account)]
+	if !ok {
+		return true // no state recorded → schedulable
+	}
+	return state == nil || !state.Active
+}
+
+// batchGetKiroCooldownStates fetches cooldown states for all Kiro OAuth
+// accounts in a single pipeline call. Returns nil on error so callers can
+// fall back to the per-account path.
+func (s *GatewayService) batchGetKiroCooldownStates(ctx context.Context, accounts []Account) map[string]*kirocooldown.State {
+	if s.kiroCooldownStore == nil {
+		return nil
+	}
+	tokenKeys := make([]string, 0, len(accounts))
+	for i := range accounts {
+		acc := &accounts[i]
+		if acc.Platform == PlatformKiro && acc.Type == AccountTypeOAuth {
+			tokenKeys = append(tokenKeys, buildKiroAccountKey(acc))
+		}
+	}
+	if len(tokenKeys) == 0 {
+		return nil
+	}
+	states, err := s.kiroCooldownStore.GetStateBatch(ctx, tokenKeys)
+	if err != nil {
+		return nil // degrade gracefully; per-account fallback still works
+	}
+	return states
+}
+
 func (s *GatewayService) tryRecoverKiroCooldownPool(ctx context.Context, accounts []Account, requestedModel string, excludedIDs map[int64]struct{}, allowMixedScheduling bool) bool {
 	if s == nil || s.kiroCooldownStore == nil || ctx.Value(kiroCooldownRecoveryAttemptedKey) == true {
 		return false
@@ -2402,15 +2509,26 @@ func (s *GatewayService) tryRecoverKiroCooldownPool(ctx context.Context, account
 	if len(tokenKeys) == 0 {
 		return false
 	}
-	cleared, err := s.kiroCooldownStore.ClearEarliestTransientCooldown(ctx, tokenKeys)
-	if err != nil {
-		logger.LegacyPrintf("service.gateway", "Kiro cooldown pool recovery failed: %v", err)
+	// singleflight: collapse concurrent in-process recovery attempts so only one
+	// goroutine calls ClearEarliestTransientCooldown at a time. The store-level
+	// distributed lock (SET NX) handles cross-instance coordination.
+	ch := s.kiroRecoverySFG.DoChan("kiro-cooldown-recovery", func() (interface{}, error) {
+		return s.kiroCooldownStore.ClearEarliestTransientCooldown(ctx, tokenKeys)
+	})
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			logger.LegacyPrintf("service.gateway", "Kiro cooldown pool recovery failed: %v", res.Err)
+			return false
+		}
+		cleared, _ := res.Val.(bool)
+		if cleared {
+			logger.LegacyPrintf("service.gateway", "Kiro cooldown pool recovery cleared one transient cooldown")
+		}
+		return cleared
+	case <-ctx.Done():
 		return false
 	}
-	if cleared {
-		logger.LegacyPrintf("service.gateway", "Kiro cooldown pool recovery cleared one transient cooldown")
-	}
-	return cleared
 }
 
 func (s *GatewayService) kiroTransientCooldownRecoveryKeys(ctx context.Context, accounts []Account, requestedModel string, excludedIDs map[int64]struct{}, allowMixedScheduling bool) []string {
@@ -3147,6 +3265,8 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 		// 提前预取窗口费用+RPM 计数，确保 routing 段内的调度检查调用能命中缓存
 		ctx = s.withWindowCostPrefetch(ctx, accounts)
 		ctx = s.withRPMPrefetch(ctx, accounts)
+		// 批量预取 Kiro cooldown 状态（避免 N 次串行 RTT）
+		routingKiroCooldownStates := s.batchGetKiroCooldownStates(ctx, accounts)
 
 		routingSet := make(map[int64]struct{}, len(routingAccountIDs))
 		for _, id := range routingAccountIDs {
@@ -3178,7 +3298,10 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 			if requestedModel != "" && !s.isModelSupportedByAccountWithContext(ctx, acc, requestedModel) {
 				continue
 			}
-			if !s.isAccountSchedulableForModelSelection(ctx, acc, requestedModel) {
+			if !acc.IsSchedulableForModelWithContext(ctx, requestedModel) {
+				continue
+			}
+			if !s.isKiroRuntimeSchedulableFromCache(acc, routingKiroCooldownStates) {
 				continue
 			}
 			if !s.isAccountSchedulableForQuota(acc) {
@@ -3264,6 +3387,8 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 	// 批量预取窗口费用+RPM 计数，避免逐个账号查询（N+1）
 	ctx = s.withWindowCostPrefetch(ctx, accounts)
 	ctx = s.withRPMPrefetch(ctx, accounts)
+	// 批量预取 Kiro cooldown 状态（避免 N 次串行 RTT）
+	kiroCooldownStates := s.batchGetKiroCooldownStates(ctx, accounts)
 
 	// 3. 按优先级+最久未用选择（考虑模型支持）
 	// needsUpstreamCheck 仅在主选择循环中使用；粘性会话命中时跳过此检查，
@@ -3292,7 +3417,10 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 		if needsUpstreamCheck && s.isUpstreamModelRestrictedByChannel(ctx, *groupID, acc, requestedModel) {
 			continue
 		}
-		if !s.isAccountSchedulableForModelSelection(ctx, acc, requestedModel) {
+		if !acc.IsSchedulableForModelWithContext(ctx, requestedModel) {
+			continue
+		}
+		if !s.isKiroRuntimeSchedulableFromCache(acc, kiroCooldownStates) {
 			continue
 		}
 		if !s.isAccountSchedulableForQuota(acc) {

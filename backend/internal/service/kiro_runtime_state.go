@@ -17,6 +17,7 @@ type KiroCooldownStore interface {
 	Mark429(ctx context.Context, tokenKey string) (time.Duration, error)
 	MarkSuspended(ctx context.Context, tokenKey string) (time.Duration, error)
 	GetState(ctx context.Context, tokenKey string) (*kirocooldown.State, error)
+	GetStateBatch(ctx context.Context, tokenKeys []string) (map[string]*kirocooldown.State, error)
 	ClearEarliestTransientCooldown(ctx context.Context, tokenKeys []string) (bool, error)
 }
 
@@ -28,9 +29,14 @@ func asKiroCooldownFailoverError(err error) *UpstreamFailoverError {
 	if !errors.As(err, &cooldownErr) {
 		return nil
 	}
+	remainingSec := int(cooldownErr.Remaining().Seconds())
+	if remainingSec < 0 {
+		remainingSec = 0
+	}
 	return &UpstreamFailoverError{
-		StatusCode:   http.StatusTooManyRequests,
-		ResponseBody: []byte(cooldownErr.Error()),
+		StatusCode:               http.StatusTooManyRequests,
+		ResponseBody:             []byte(cooldownErr.Error()),
+		KiroCooldownRemainingSec: remainingSec,
 	}
 }
 

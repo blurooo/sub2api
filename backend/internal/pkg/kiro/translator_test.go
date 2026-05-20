@@ -25,8 +25,9 @@ func TestBuildRuntimeUserAgentStable(t *testing.T) {
 
 	require.Equal(t, ua1, ua2)
 	require.Contains(t, ua1, "KiroIDE-")
-	require.Contains(t, amzUA, "KiroIDE-")
-	require.Contains(t, ua1, "KiroIDE-0.11.")
+	// amzUA uses space separator when machineID is present: "KiroIDE <version> <machineID>"
+	require.Contains(t, amzUA, "KiroIDE ")
+	require.Contains(t, ua1, "KiroIDE-0.12.")
 	require.Contains(t, ua1, "aws-sdk-js/1.0.34")
 	require.Contains(t, ua1, "md/nodejs#22.22.0")
 	require.Contains(t, ua1, machineID)
@@ -253,12 +254,15 @@ func TestBuildKiroPayloadInjectsChunkedWritePolicyIntoSystemPrompt(t *testing.T)
 	payload := kiroBuildResult.Payload
 
 	systemContent := gjson.GetBytes(payload, "conversationState.history.0.userInputMessage.content").String()
-	require.Contains(t, systemContent, "<thinking_mode>enabled</thinking_mode>")
-	require.Less(t, strings.Index(systemContent, "<thinking_mode>enabled</thinking_mode>"), strings.Index(systemContent, "<CRITICAL_OVERRIDE>"))
+	// XML thinking tags must NOT appear in system prompt (moved to additionalModelRequestFields)
+	require.NotContains(t, systemContent, "<thinking_mode>")
+	require.Contains(t, systemContent, "<CRITICAL_OVERRIDE>")
 	require.Less(t, strings.Index(systemContent, "<CRITICAL_OVERRIDE>"), strings.Index(systemContent, "Follow user instructions."))
 	require.Contains(t, systemContent, "Follow user instructions.")
 	require.Contains(t, systemContent, systemChunkedWritePolicy)
 	require.Equal(t, 1, strings.Count(systemContent, systemChunkedWritePolicy))
+	// thinking control is via API field
+	require.True(t, gjson.GetBytes(payload, "additionalModelRequestFields.output_config.effort").Exists())
 }
 
 func TestBuildKiroPayloadInjectsThinkingIntoHistory(t *testing.T) {
@@ -277,9 +281,13 @@ func TestBuildKiroPayloadInjectsThinkingIntoHistory(t *testing.T) {
 
 	require.Equal(t, "hello kiro", gjson.GetBytes(payload, "conversationState.currentMessage.userInputMessage.content").String())
 	systemContent := gjson.GetBytes(payload, "conversationState.history.0.userInputMessage.content").String()
-	require.Contains(t, systemContent, "<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>2048</max_thinking_length>")
+	// XML tags removed from system prompt
+	require.NotContains(t, systemContent, "<thinking_mode>")
+	require.NotContains(t, systemContent, "<max_thinking_length>")
 	require.Contains(t, systemContent, "[Context: Current time is ")
 	require.Equal(t, "I will follow these instructions.", gjson.GetBytes(payload, "conversationState.history.1.assistantResponseMessage.content").String())
+	// budget_tokens=2048 → "low"
+	require.Equal(t, "low", gjson.GetBytes(payload, "additionalModelRequestFields.output_config.effort").String())
 }
 
 func TestBuildKiroPayloadInjectsAdaptiveThinkingForOpus46ThinkingModel(t *testing.T) {
@@ -293,8 +301,12 @@ func TestBuildKiroPayloadInjectsAdaptiveThinkingForOpus46ThinkingModel(t *testin
 	payload := kiroBuildResult.Payload
 
 	systemContent := gjson.GetBytes(payload, "conversationState.history.0.userInputMessage.content").String()
-	require.Contains(t, systemContent, "<thinking_mode>adaptive</thinking_mode>\n<thinking_effort>high</thinking_effort>")
+	// XML tags removed from system prompt
+	require.NotContains(t, systemContent, "<thinking_mode>")
 	require.Contains(t, systemContent, "[Context: Current time is ")
+	// budget=20000 → "high"
+	require.Equal(t, "high", gjson.GetBytes(payload, "additionalModelRequestFields.output_config.effort").String())
+	require.Equal(t, "adaptive", gjson.GetBytes(payload, "additionalModelRequestFields.thinking.type").String())
 }
 
 func TestBuildKiroPayloadInjectsThinkingForThinkingAliasModel(t *testing.T) {
@@ -308,7 +320,9 @@ func TestBuildKiroPayloadInjectsThinkingForThinkingAliasModel(t *testing.T) {
 	payload := kiroBuildResult.Payload
 
 	systemContent := gjson.GetBytes(payload, "conversationState.history.0.userInputMessage.content").String()
-	require.Contains(t, systemContent, "<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>20000</max_thinking_length>")
+	require.NotContains(t, systemContent, "<thinking_mode>")
+	// budget=20000 → "high"
+	require.Equal(t, "high", gjson.GetBytes(payload, "additionalModelRequestFields.output_config.effort").String())
 }
 
 func TestBuildKiroPayloadHeaderOnlyThinking(t *testing.T) {
@@ -325,7 +339,9 @@ func TestBuildKiroPayloadHeaderOnlyThinking(t *testing.T) {
 	payload := kiroBuildResult.Payload
 
 	systemContent := gjson.GetBytes(payload, "conversationState.history.0.userInputMessage.content").String()
-	require.Contains(t, systemContent, "<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>16000</max_thinking_length>")
+	require.NotContains(t, systemContent, "<thinking_mode>")
+	// budget=16000 → "high"
+	require.Equal(t, "high", gjson.GetBytes(payload, "additionalModelRequestFields.output_config.effort").String())
 }
 
 func TestBuildKiroPayloadInjectsToolChoiceHints(t *testing.T) {
@@ -1658,4 +1674,94 @@ func buildEventStreamFrame(t *testing.T, eventType string, payload any) []byte {
 	_, _ = frame.Write(payloadBytes)
 	require.NoError(t, binary.Write(frame, binary.BigEndian, uint32(0)))
 	return frame.Bytes()
+}
+
+func TestKiroConversationIDStable(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("X-Claude-Code-Session-Id", "test-session-123")
+
+	body := []byte(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hello"}],"max_tokens":100}`)
+
+	r1, err := BuildKiroPayloadWithContext(body, "claude-sonnet-4.5", "", "AI_EDITOR", headers)
+	require.NoError(t, err)
+	r2, err := BuildKiroPayloadWithContext(body, "claude-sonnet-4.5", "", "AI_EDITOR", headers)
+	require.NoError(t, err)
+
+	id1 := gjson.GetBytes(r1.Payload, "conversationState.conversationId").String()
+	id2 := gjson.GetBytes(r2.Payload, "conversationState.conversationId").String()
+	require.NotEmpty(t, id1)
+	require.Equal(t, id1, id2, "same session should get same conversationId")
+
+	// different session gets a different conversationId
+	headers2 := http.Header{}
+	headers2.Set("X-Claude-Code-Session-Id", "other-session-456")
+	r3, err := BuildKiroPayloadWithContext(body, "claude-sonnet-4.5", "", "AI_EDITOR", headers2)
+	require.NoError(t, err)
+	id3 := gjson.GetBytes(r3.Payload, "conversationState.conversationId").String()
+	require.NotEqual(t, id1, id3, "different sessions should get different conversationId")
+}
+
+func TestBudgetTokensToEffort(t *testing.T) {
+	cases := []struct {
+		budget   int
+		expected string
+	}{
+		{0, "low"},
+		{4999, "low"},
+		{5000, "medium"},
+		{10000, "medium"},
+		{14999, "medium"},
+		{15000, "high"},
+		{29999, "high"},
+		{30000, "max"},
+		{50000, "max"},
+	}
+	for _, tc := range cases {
+		require.Equal(t, tc.expected, budgetTokensToEffort(tc.budget), "budget=%d", tc.budget)
+	}
+}
+
+func TestBuildKiroPayloadThinkingUsesAdditionalModelRequestFields(t *testing.T) {
+	body := []byte(`{
+		"model": "claude-sonnet-4-5",
+		"system": "You are a helpful assistant.",
+		"messages": [{"role": "user", "content": "hello"}],
+		"thinking": {"type": "enabled", "budget_tokens": 10000}
+	}`)
+
+	result, err := BuildKiroPayloadWithContext(body, "claude-sonnet-4.5", "arn:aws:codewhisperer:us-east-1:123456789012:profile/test", "AI_EDITOR", nil)
+	require.NoError(t, err)
+	payload := result.Payload
+
+	// effort should be "medium" for budget_tokens=10000
+	effort := gjson.GetBytes(payload, "additionalModelRequestFields.output_config.effort").String()
+	require.Equal(t, "medium", effort)
+
+	// thinking type should be "adaptive"
+	thinkingType := gjson.GetBytes(payload, "additionalModelRequestFields.thinking.type").String()
+	require.Equal(t, "adaptive", thinkingType)
+
+	// no XML thinking tags should appear anywhere in the payload
+	require.NotContains(t, string(payload), "<thinking_mode>")
+	require.NotContains(t, string(payload), "<thinking_effort>")
+	require.NotContains(t, string(payload), "<max_thinking_length>")
+
+	// context should record the effort
+	require.Equal(t, "medium", result.Context.ThinkingEffort)
+	require.True(t, result.Context.ThinkingEnabled)
+}
+
+func TestBuildKiroPayloadNoThinkingOmitsAdditionalModelRequestFields(t *testing.T) {
+	body := []byte(`{
+		"model": "claude-sonnet-4-5",
+		"messages": [{"role": "user", "content": "hello"}]
+	}`)
+
+	result, err := BuildKiroPayloadWithContext(body, "claude-sonnet-4.5", "", "AI_EDITOR", nil)
+	require.NoError(t, err)
+	payload := result.Payload
+
+	require.False(t, gjson.GetBytes(payload, "additionalModelRequestFields").Exists())
+	require.False(t, result.Context.ThinkingEnabled)
+	require.Equal(t, "", result.Context.ThinkingEffort)
 }

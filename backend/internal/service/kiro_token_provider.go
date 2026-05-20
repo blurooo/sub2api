@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strconv"
 	"strings"
@@ -9,8 +11,8 @@ import (
 )
 
 const (
-	kiroTokenRefreshSkew = 3 * time.Minute
-	kiroTokenCacheSkew   = 5 * time.Minute
+	kiroTokenRefreshSkew = 5 * time.Minute // trigger refresh 5 min before expiry
+	kiroTokenCacheSkew   = 3 * time.Minute // cache TTL cutoff 3 min before expiry (expires after refresh triggers)
 )
 
 type KiroTokenCache = GeminiTokenCache
@@ -80,17 +82,20 @@ func (p *KiroTokenProvider) GetAccessToken(ctx context.Context, account *Account
 				if token, cacheErr := p.tokenCache.GetAccessToken(ctx, cacheKey); cacheErr == nil && strings.TrimSpace(token) != "" {
 					return token, nil
 				}
+				// Cache miss while another goroutine holds the refresh lock.
+				// Wait briefly and retry once — the lock holder should populate the cache shortly.
+				time.Sleep(500 * time.Millisecond)
+				if token, cacheErr := p.tokenCache.GetAccessToken(ctx, cacheKey); cacheErr == nil && strings.TrimSpace(token) != "" {
+					return token, nil
+				}
 			}
 		} else {
 			account = result.Account
 			expiresAt = account.GetCredentialAsTime("expires_at")
 		}
-	} else if needsRefresh && p.tokenCache != nil {
-		locked, lockErr := p.tokenCache.AcquireRefreshLock(ctx, cacheKey, 30*time.Second)
-		if lockErr == nil && locked {
-			defer func() { _ = p.tokenCache.ReleaseRefreshLock(ctx, cacheKey) }()
-		}
 	}
+	// When needsRefresh is true but refreshAPI is nil there is no refresh action to take,
+	// so acquiring a Redis lock here would be meaningless — skip it entirely.
 
 	accessToken := account.GetCredential("access_token")
 	if strings.TrimSpace(accessToken) == "" {
@@ -124,17 +129,49 @@ func (p *KiroTokenProvider) GetAccessToken(ctx context.Context, account *Account
 	return accessToken, nil
 }
 
+// KiroTokenCacheKey returns the Redis/memory cache key for a short-lived access token.
+//
+// Key design notes vs. the other two key functions in this package:
+//
+//   - kiroCacheCredentialKey (kiro_cache_emulation.go): identifies a full credential
+//     bundle (refresh_token, api_key, etc.) used for cache-based OIDC emulation. It
+//     intentionally includes every credential field so that any credential change
+//     produces a distinct slot.
+//
+//   - buildKiroAccountKey (kiro_http_helpers.go): identifies the runtime fingerprint
+//     (User-Agent, OS version, etc.) tied to an IDC client. It also includes
+//     profile_arn so that different AWS permission sets get independent fingerprints.
+//
+//   - KiroTokenCacheKey (this function): caches the bearer access token that is
+//     scoped to a specific (IDC client, AWS profile) pair. A single IDC client_id can
+//     be bound to multiple profile_arns (different AWS accounts / permission sets),
+//     each producing a distinct STS token. Without profile_arn in the key, tokens
+//     from different profiles collide and cause authentication errors.
+//
+// When profile_arn is absent the key is identical to the previous format, so existing
+// cache entries expire naturally without any forced invalidation.
 func KiroTokenCacheKey(account *Account) string {
 	if account == nil {
 		return "kiro:account:0"
 	}
+	profileSuffix := kiroProfileArnSuffix(account.GetCredential("profile_arn"))
 	if clientIDHash := strings.TrimSpace(account.GetCredential("client_id_hash")); clientIDHash != "" {
-		return "kiro:" + clientIDHash
+		return "kiro:" + clientIDHash + profileSuffix
 	}
 	if clientID := strings.TrimSpace(account.GetCredential("client_id")); clientID != "" {
-		return "kiro:client:" + clientID
+		return "kiro:client:" + clientID + profileSuffix
 	}
 	return "kiro:account:" + strconv.FormatInt(account.ID, 10)
+}
+
+// kiroProfileArnSuffix returns ":<sha8(profileArn)>" when profileArn is non-empty,
+// or "" otherwise (preserving backward-compatible key format).
+func kiroProfileArnSuffix(profileArn string) string {
+	if profileArn = strings.TrimSpace(profileArn); profileArn == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(profileArn))
+	return ":" + hex.EncodeToString(sum[:8])
 }
 
 func (p *KiroTokenProvider) ForceRefreshAccessToken(ctx context.Context, account *Account) (string, error) {
@@ -188,9 +225,12 @@ func (p *KiroTokenProvider) ForceRefreshAccessToken(ctx context.Context, account
 		return "", err
 	}
 
-	accessToken := strings.TrimSpace(account.GetCredential("access_token"))
+	// Prefer tokenInfo.AccessToken (the freshly-issued value) over the in-memory
+	// account credential, because persistAccountCredentials writes to the repo but
+	// does not guarantee a write-back to the account struct in memory.
+	accessToken := strings.TrimSpace(tokenInfo.AccessToken)
 	if accessToken == "" {
-		accessToken = strings.TrimSpace(tokenInfo.AccessToken)
+		accessToken = strings.TrimSpace(account.GetCredential("access_token"))
 	}
 	if accessToken == "" {
 		return "", errors.New("access_token not found after kiro refresh")

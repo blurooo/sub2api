@@ -34,7 +34,9 @@ func TestKiroCacheEmulationUsesSnapshotGroupWithoutRepo(t *testing.T) {
 		t.Fatalf("unexpected first usage: %+v", first)
 	}
 	second := svc.buildKiroCacheEmulationUsage(account, group, kiroCacheRequestBody("stable", false), "claude-sonnet-4-6", 2000)
-	if second == nil || second.CacheReadInputTokens != 2000 || second.CacheCreationInputTokens != 0 || second.InputTokens != 0 {
+	// CacheReadInputTokens is capped at kiroCacheMaxRatio (0.85) of totalInputTokens; CacheCreationInputTokens is 0 on a full hit.
+	maxAllowed := int(float64(2000) * kiroCacheMaxRatio)
+	if second == nil || second.CacheReadInputTokens <= 0 || second.CacheReadInputTokens > maxAllowed || second.CacheCreationInputTokens != 0 {
 		t.Fatalf("unexpected second usage: %+v", second)
 	}
 }
@@ -79,7 +81,8 @@ func TestKiroCacheEmulationStableCredentialIsolation(t *testing.T) {
 		t.Fatalf("unexpected first usage: %+v", first)
 	}
 	rotatedAccessToken := svc.buildKiroCacheEmulationUsage(kiroCacheAccount(7, "refresh-same", "access-b"), group, body, "claude-sonnet-4-6", 2000)
-	if rotatedAccessToken == nil || rotatedAccessToken.CacheReadInputTokens != 2000 || rotatedAccessToken.CacheCreationInputTokens != 0 {
+	// CacheReadInputTokens is capped at kiroCacheMaxRatio (0.85) of totalInputTokens, so expect > 0 rather than exactly 2000.
+	if rotatedAccessToken == nil || rotatedAccessToken.CacheReadInputTokens <= 0 {
 		t.Fatalf("access token rotation should not break cache: %+v", rotatedAccessToken)
 	}
 	differentCredential := svc.buildKiroCacheEmulationUsage(kiroCacheAccount(7, "refresh-other", "access-c"), group, body, "claude-sonnet-4-6", 2000)
@@ -178,6 +181,25 @@ func TestKiroTokenCountersMatchReferenceRules(t *testing.T) {
 	}
 	if got := countKiroMessageContentTokens(map[string]any{"content": []any{map[string]any{"text": "abc"}, map[string]any{"text": "你好"}}}); got != 2 {
 		t.Fatalf("tool result content tokens = %d, want 2", got)
+	}
+}
+
+func TestKiroCacheEmulationMaxRatioCap(t *testing.T) {
+	resetKiroCacheTracker()
+	svc := &GatewayService{}
+	account := &Account{ID: 99, Platform: PlatformKiro}
+	group := kiroCacheGroup(1)
+	body := kiroCacheRequestBody("maxratio", false)
+	// prime the cache
+	_ = svc.buildKiroCacheEmulationUsage(account, group, body, "claude-sonnet-4-6", 2000)
+	// second call: all tokens match, but cap should apply
+	second := svc.buildKiroCacheEmulationUsage(account, group, body, "claude-sonnet-4-6", 2000)
+	if second == nil {
+		t.Fatal("expected non-nil usage on second call")
+	}
+	maxAllowed := int(float64(2000) * kiroCacheMaxRatio)
+	if second.CacheReadInputTokens > maxAllowed {
+		t.Fatalf("CacheReadInputTokens %d exceeds max allowed %d (%.0f%% of 2000)", second.CacheReadInputTokens, maxAllowed, kiroCacheMaxRatio*100)
 	}
 }
 

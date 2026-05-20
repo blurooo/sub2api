@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -20,6 +21,7 @@ type GroupHandler struct {
 	adminService         service.AdminService
 	dashboardService     *service.DashboardService
 	groupCapacityService *service.GroupCapacityService
+	gatewayService       *service.GatewayService
 }
 
 type optionalLimitField struct {
@@ -72,11 +74,12 @@ func (f optionalLimitField) ToServiceInput() *float64 {
 }
 
 // NewGroupHandler creates a new admin group handler
-func NewGroupHandler(adminService service.AdminService, dashboardService *service.DashboardService, groupCapacityService *service.GroupCapacityService) *GroupHandler {
+func NewGroupHandler(adminService service.AdminService, dashboardService *service.DashboardService, groupCapacityService *service.GroupCapacityService, gatewayService *service.GatewayService) *GroupHandler {
 	return &GroupHandler{
 		adminService:         adminService,
 		dashboardService:     dashboardService,
 		groupCapacityService: groupCapacityService,
+		gatewayService:       gatewayService,
 	}
 }
 
@@ -581,4 +584,27 @@ func (h *GroupHandler) UpdateSortOrder(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{"message": "Sort order updated successfully"})
+}
+
+// GetKiroPoolStatus returns a snapshot of Kiro OAuth account pool health for a group.
+// GET /api/v1/admin/groups/:id/kiro-pool-status
+func (h *GroupHandler) GetKiroPoolStatus(c *gin.Context) {
+	groupID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid group ID")
+		return
+	}
+
+	if h.gatewayService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "gateway service unavailable"})
+		return
+	}
+
+	status, err := h.gatewayService.GetKiroPoolStatus(c.Request.Context(), &groupID)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+
+	response.Success(c, status)
 }

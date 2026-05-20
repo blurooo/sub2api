@@ -117,6 +117,9 @@ type OpsUpstreamErrorEvent struct {
 
 	Message string `json:"message,omitempty"`
 	Detail  string `json:"detail,omitempty"`
+
+	// Kiro 专属诊断字段：cooldown 剩余秒数（仅 Kiro 账号触发 cooldown 时填充）
+	KiroCooldownRemaining int `json:"kiro_cooldown_remaining_seconds,omitempty"`
 }
 
 func appendOpsUpstreamError(c *gin.Context, ev OpsUpstreamErrorEvent) {

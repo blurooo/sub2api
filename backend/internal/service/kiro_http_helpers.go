@@ -5,10 +5,17 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"runtime"
 	"strings"
 
 	kiropkg "github.com/Wei-Shaw/sub2api/internal/pkg/kiro"
 	"github.com/google/uuid"
+)
+
+const (
+	// 来源：官方 Kiro 客户端硬编码值，需跟随官方客户端更新
+	kiroSocialProfileARN    = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+	kiroBuilderIDProfileARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
 )
 
 func buildKiroAccountKey(account *Account) string {
@@ -22,6 +29,15 @@ func buildKiroAccountKey(account *Account) string {
 		account.GetCredential("profile_arn"),
 		account.ID,
 	)
+}
+
+// truncateKiroAccountKey returns the first 8 characters of a Kiro account key
+// for use as a lightweight, partially-anonymised diagnostic identifier.
+func truncateKiroAccountKey(key string) string {
+	if len(key) > 8 {
+		return key[:8]
+	}
+	return key
 }
 
 func buildKiroMachineID(account *Account) string {
@@ -130,7 +146,25 @@ func resolveKiroPayloadProfileArn(account *Account) string {
 	if account == nil {
 		return ""
 	}
-	return strings.TrimSpace(account.GetCredential("profile_arn"))
+	if arn := strings.TrimSpace(account.GetCredential("profile_arn")); arn != "" {
+		return arn
+	}
+	provider := strings.TrimSpace(account.GetCredential("provider"))
+	if strings.EqualFold(provider, "Github") || strings.EqualFold(provider, "Google") {
+		return kiroSocialProfileARN
+	}
+	return kiroBuilderIDProfileARN
+}
+
+func idcRustOS() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "windows"
+	case "darwin":
+		return "macos"
+	default:
+		return "linux"
+	}
 }
 
 func newKiroJSONRequest(ctx context.Context, endpointURL string, payload []byte, token, accountKey, machineID, amzTarget string, account *Account) (*http.Request, error) {
@@ -141,9 +175,19 @@ func newKiroJSONRequest(ctx context.Context, endpointURL string, payload []byte,
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("User-Agent", kiropkg.BuildRuntimeUserAgent(accountKey, machineID))
-	req.Header.Set("X-Amz-User-Agent", kiropkg.BuildRuntimeAmzUserAgent(accountKey, machineID))
-	req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+
+	isIDC := account != nil && strings.EqualFold(strings.TrimSpace(account.GetCredential("auth_method")), "external_idp")
+	if isIDC {
+		os := idcRustOS()
+		req.Header.Set("User-Agent", fmt.Sprintf("aws-sdk-rust/1.3.9 os/%s lang/rust/1.87.0", os))
+		req.Header.Set("X-Amz-User-Agent", fmt.Sprintf("aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/%s lang/rust/1.87.0 m/E app/AmazonQ-For-CLI", os))
+		req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+	} else {
+		req.Header.Set("User-Agent", kiropkg.BuildRuntimeUserAgent(accountKey, machineID))
+		req.Header.Set("X-Amz-User-Agent", kiropkg.BuildRuntimeAmzUserAgent(accountKey, machineID))
+		req.Header.Set("x-amzn-kiro-agent-mode", "spec")
+	}
+
 	req.Header.Set("x-amzn-codewhisperer-optout", "true")
 	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.NewString())

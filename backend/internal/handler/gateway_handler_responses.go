@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
@@ -163,9 +164,11 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 	parsedReq.GroupID = apiKey.GroupID
 	parsedReq.Group = apiKey.Group
 	parsedReq.SessionContext = &service.SessionContext{
-		ClientIP:  ip.GetClientIP(c),
-		UserAgent: c.GetHeader("User-Agent"),
-		APIKeyID:  apiKey.ID,
+		ClientIP:            ip.GetClientIP(c),
+		UserAgent:           c.GetHeader("User-Agent"),
+		APIKeyID:            apiKey.ID,
+		ClaudeCodeSessionID: strings.TrimSpace(c.GetHeader("x-claude-code-session-id")),
+		OpenCodeSession:     strings.TrimSpace(c.GetHeader("x-opencode-session")),
 	}
 	sessionHash := h.gatewayService.GenerateSessionHash(parsedReq)
 

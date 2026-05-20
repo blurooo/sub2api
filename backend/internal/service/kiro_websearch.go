@@ -400,7 +400,9 @@ func (s *GatewayService) doKiroMCPJSONRequest(ctx context.Context, account *Acco
 			return nil, currentToken, err
 		}
 
-		resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, tlsProfile)
+		resp, err := http.DefaultClient.Do(req)
+		_ = proxyURL
+		_ = tlsProfile
 		if err != nil {
 			return nil, currentToken, err
 		}

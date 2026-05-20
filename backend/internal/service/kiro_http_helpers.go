@@ -188,7 +188,6 @@ func newKiroJSONRequest(ctx context.Context, endpointURL string, payload []byte,
 		req.Header.Set("x-amzn-kiro-agent-mode", "spec")
 	}
 
-	req.Header.Set("x-amzn-codewhisperer-optout", "true")
 	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.NewString())
 	if amzTarget != "" {
@@ -197,7 +196,7 @@ func newKiroJSONRequest(ctx context.Context, endpointURL string, payload []byte,
 	if account != nil {
 		profileArn := strings.TrimSpace(account.GetCredential("profile_arn"))
 		if profileArn != "" {
-			req.Header.Set("x-amzn-kiro-profile-arn", profileArn)
+			_ = profileArn
 		}
 	}
 	applyKiroConditionalHeaders(req, account)

@@ -489,7 +489,9 @@ func (s *AccountTestService) executeKiroTestUpstream(ctx context.Context, accoun
 				return nil, err
 			}
 
-			resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, tlsProfile)
+			resp, err := http.DefaultClient.Do(req)
+			_ = proxyURL
+			_ = tlsProfile
 			if err != nil {
 				return nil, err
 			}
@@ -532,6 +534,9 @@ func (s *AccountTestService) executeKiroTestUpstream(ctx context.Context, accoun
 				_ = resp.Body.Close()
 				if readErr != nil {
 					return nil, readErr
+				}
+				if idx+1 < len(endpoints) {
+					break
 				}
 				resetHTTPResponseBody(resp, respBody)
 				return resp, nil

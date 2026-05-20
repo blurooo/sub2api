@@ -375,7 +375,9 @@ func (s *GatewayService) executeKiroUpstreamWithParsed(ctx context.Context, acco
 				return nil, requestCtx, err
 			}
 
-			resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, tlsProfile)
+			resp, err := http.DefaultClient.Do(req)
+			_ = proxyURL
+			_ = tlsProfile
 			if err != nil {
 				if attempt < maxRetries {
 					if sleepErr := sleepKiroRetry(ctx, attempt); sleepErr != nil {
@@ -541,19 +543,15 @@ func buildKiroEndpoints(account *Account) []kiroEndpointConfig {
 		URL:  fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
 		Name: "AmazonQ",
 	}
-	// IDC 账号只用 AmazonQ（CodeWhisperer 不支持 IDC auth）
 	if account != nil && strings.EqualFold(strings.TrimSpace(account.GetCredential("auth_method")), "external_idp") {
 		return []kiroEndpointConfig{amazonQ}
 	}
-	// Social / Builder ID 账号：AmazonQ 优先，失败后回退 CodeWhisperer
 	codeWhisperer := kiroEndpointConfig{
 		URL:  "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
 		Name: "CodeWhisperer",
 	}
-	// AmazonQCLI (SendMessageStreaming) 端点暂未启用。
-	// 如需支持，需在 payload 中删除 agentContinuationId 和 agentTaskType 字段，
-	// 并使用 x-amzn-kiro-agent-mode: vibe。
-	return []kiroEndpointConfig{amazonQ, codeWhisperer}
+	// chaogei/Kiro-account-manager 优先 CodeWhisperer，回退 AmazonQ
+	return []kiroEndpointConfig{codeWhisperer, amazonQ}
 }
 
 func (s *GatewayService) buildKiroPayloadForAccount(ctx context.Context, account *Account, anthropicBody []byte, modelID, token, requestModel string, headers http.Header) (*kiropkg.KiroBuildResult, error) {
